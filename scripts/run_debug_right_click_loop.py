@@ -1,4 +1,4 @@
-"""CLI entrypoint for the Task Bar Hero debug right-click loop."""
+"""CLI entrypoint for the Task Bar Hero debug click loop."""
 
 from __future__ import annotations
 
@@ -16,19 +16,25 @@ def _bootstrap_import_path() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Right-click the normal and boss chest positions on a loop."
+        description="Left-click the shared Task Bar Hero chest positions on a loop."
     )
     parser.add_argument(
         "--interval-seconds",
         type=float,
         default=10.0,
-        help="Seconds to wait between right-click cycles. Default: 10",
+        help="Seconds to wait between click cycles. Default: 10",
     )
     parser.add_argument(
         "--startup-delay-seconds",
         type=float,
         default=3.0,
         help="Seconds to wait before the first click cycle. Default: 3",
+    )
+    parser.add_argument(
+        "--click-delay-seconds",
+        type=float,
+        default=0.5,
+        help="Seconds to wait between clicks on the same target. Default: 0.5",
     )
     return parser.parse_args()
 
@@ -42,6 +48,7 @@ def main() -> int:
     return run_debug_right_click_loop(
         interval_seconds=args.interval_seconds,
         startup_delay_seconds=args.startup_delay_seconds,
+        click_delay_seconds=args.click_delay_seconds,
     )
 
 
