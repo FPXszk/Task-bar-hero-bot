@@ -8,6 +8,7 @@ Task Bar Hero の操作を段階的に自動化するためのリポジトリで
 - マウスクリックした位置のスクリーン座標を取得する
 - 複数回クリックして、あとで座標を共有できる
 - 宝箱座標をデバッグ用に定期左クリック連打する
+- 宝箱座標を 10 分に 1 回の間隔で定期左クリック連打する
 
 ## セットアップ
 Windows で仮想環境を作る例:
@@ -82,3 +83,18 @@ py -3 scripts\run_debug_right_click_loop.py --startup-delay-seconds 5 --interval
 ```
 
 実行中は各クリックの対象名、座標、時刻、何回目のクリックかがターミナルに表示されます。停止したいときは `Ctrl+C` です。
+
+## 10 分間隔クリックループ
+同じ 3 つの座標に対して、10 分ごとに左クリック連打を行う本番寄りの実行スクリプトです。
+
+```bash
+py -3 scripts\run_ten_minute_click_loop.py
+```
+
+デフォルトでは 600 秒ごとにサイクルを回します。待機秒数や間隔を変えたい場合:
+
+```bash
+py -3 scripts\run_ten_minute_click_loop.py --startup-delay-seconds 5 --interval-seconds 600 --click-delay-seconds 0.5
+```
+
+このスクリプトでも、クリックごとの対象名、座標、時刻、何回目のクリックかをターミナルに表示します。停止したいときは `Ctrl+C` です。
