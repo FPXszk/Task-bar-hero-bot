@@ -1,0 +1,187 @@
+name: Night Batch Self Hosted
+
+on:
+  workflow_dispatch:
+    inputs:
+      config_path:
+        description: JSON config path relative to the repository root
+        required: true
+        default: config/night_batch/bundle-foreground-reuse-config.json
+
+jobs:
+  start-night-batch:
+    timeout-minutes: 540
+    runs-on:
+      - self-hosted
+      - windows
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Install dependencies in WSL workspace
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%I in (`wsl.exe wslpath -a "%CD%"`) do set "REPO_WSL=%%I"
+          if not defined REPO_WSL exit /b 1
+          wsl.exe bash -lc "cd \"%REPO_WSL%\" && npm ci --silent"
+
+      - name: Record live checkout baseline
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -command ". '{0}'"
+        run: |
+          & scripts/windows/github-actions/write-night-batch-live-checkout-baseline.ps1 -RunId 'gha_${{ github.run_id }}_${{ github.run_attempt }}' -RunAttempt '${{ github.run_attempt }}' -BundleConfigPath '${{ inputs.config_path }}'
+
+      - name: Ensure TradingView is running
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -command ". '{0}'"
+        run: |
+          $configPath = Join-Path $PWD '${{ inputs.config_path }}'
+          $config = Get-Content -Raw -Path $configPath | ConvertFrom-Json
+          $runtime = $config.runtime
+          $launch = $config.launch
+          if (-not $runtime -or -not $launch) {
+            throw "Config is missing runtime or launch sections: $configPath"
+          }
+
+          $startupUrl = "http://$($runtime.startup_check_host):$($runtime.startup_check_port)/json/list"
+          $alreadyRunning = $false
+          try {
+            $response = Invoke-WebRequest -UseBasicParsing -Uri $startupUrl -TimeoutSec 3
+            if ($response.Content -match 'tradingview' -and $response.Content -match '/chart') {
+              $alreadyRunning = $true
+              Write-Host "[diag] TradingView already reachable at $startupUrl"
+            }
+          } catch {
+            Write-Host "[diag] TradingView not reachable at $startupUrl; launching shortcut"
+          }
+
+          if (-not $alreadyRunning) {
+            if ($launch.shortcut_path -and (Test-Path $launch.shortcut_path)) {
+              Start-Process -FilePath $launch.shortcut_path -WindowStyle Normal
+            } else {
+              $shortcut = $null
+              $shortcutDir = Split-Path -Parent $launch.shortcut_path
+              if ($shortcutDir -and (Test-Path $shortcutDir)) {
+                $shortcut = Get-ChildItem -Path $shortcutDir -Filter '*.lnk' -File |
+                  Where-Object { $_.Name -match 'TradingView' } |
+                  Select-Object -First 1 -ExpandProperty FullName
+              }
+
+              if ($shortcut) {
+                Start-Process -FilePath $shortcut -WindowStyle Normal
+                Start-Sleep -Seconds $runtime.launch_wait_sec
+                return
+              }
+
+              $launcher = Join-Path $env:LOCALAPPDATA 'TradingView\TradingView.exe'
+              if (-not (Test-Path $launcher)) {
+                throw "No TradingView launcher found at $launcher, $($launch.shortcut_path), or any TradingView shortcut in $shortcutDir"
+              }
+              Start-Process -FilePath $launcher -ArgumentList "--remote-debugging-port=$($runtime.startup_check_port)" -WindowStyle Normal
+            }
+            Start-Sleep -Seconds $runtime.launch_wait_sec
+          }
+
+      - name: Readiness diagnostics (non-blocking)
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%I in (`wsl.exe wslpath -a "%CD%"`) do set "REPO_WSL=%%I"
+          if not defined REPO_WSL exit /b 0
+          set "NIGHT_BATCH_CONFIG=${{ inputs.config_path }}"
+          if "%NIGHT_BATCH_CONFIG%"=="" set "NIGHT_BATCH_CONFIG=config/night_batch/bundle-foreground-reuse-config.json"
+          echo [readiness-diag] Checking port connectivity and readiness
+          echo [readiness-diag] startup_check_port (local):
+          wsl.exe bash -lc "cd \"%REPO_WSL%\" && python3 -c \"import json,sys; c=json.load(open(sys.argv[1])); h=c.get('runtime',{}).get('startup_check_host','localhost'); p=c.get('runtime',{}).get('startup_check_port',9222); print(f'  host={h} port={p}'); import urllib.request; urllib.request.urlopen(f'http://{h}:{p}/json/list',timeout=3); print('  status=reachable')\" \"%NIGHT_BATCH_CONFIG%\"" 2>&1 || echo [readiness-diag] startup_check_port: UNREACHABLE
+          echo [readiness-diag] bridge port (WSL):
+          wsl.exe bash -lc "cd \"%REPO_WSL%\" && python3 -c \"import json,sys; c=json.load(open(sys.argv[1])); h=c.get('runtime',{}).get('host','172.31.144.1'); p=c.get('runtime',{}).get('port',9223); print(f'  host={h} port={p}'); import urllib.request; urllib.request.urlopen(f'http://{h}:{p}/json/list',timeout=3); print('  status=reachable')\" \"%NIGHT_BATCH_CONFIG%\"" 2>&1 || echo [readiness-diag] bridge port: UNREACHABLE
+          echo [readiness-diag] tv status readiness:
+          wsl.exe bash -lc "cd \"%REPO_WSL%\" && python3 -c \"import json, os, subprocess, sys; c=json.load(open(sys.argv[1])); runtime=c.get('runtime',{}); host=str(runtime.get('host','172.31.144.1')); port=str(runtime.get('port',9223)); print(f'  host={host} port={port}'); env=dict(os.environ, TV_CDP_HOST=host, TV_CDP_PORT=port); proc=subprocess.run(['node','src/cli/index.js','status'], env=env, text=True, capture_output=True); sys.stdout.write(proc.stdout); sys.stderr.write(proc.stderr); raise SystemExit(proc.returncode)\" \"%NIGHT_BATCH_CONFIG%\"" 2>&1 || echo [readiness-diag] tv status: FAILED
+          echo [readiness-diag] done
+        continue-on-error: true
+
+      - name: Wait for TradingView connection (required gate)
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%I in (`wsl.exe wslpath -a "%CD%"`) do set "REPO_WSL=%%I"
+          if not defined REPO_WSL exit /b 1
+          set "NIGHT_BATCH_CONFIG=${{ inputs.config_path }}"
+          if "%NIGHT_BATCH_CONFIG%"=="" set "NIGHT_BATCH_CONFIG=config/night_batch/bundle-foreground-reuse-config.json"
+          echo [connection-gate] Waiting for TradingView connection before smoke-prod
+          wsl.exe bash -lc "cd \"%REPO_WSL%\" && node scripts/backtest/wait-for-tradingview-readiness.mjs --config \"%NIGHT_BATCH_CONFIG%\" --timeout-sec 180 --interval-sec 5"
+
+      - name: Run foreground production
+        shell: cmd
+        run: |
+          set "NIGHT_BATCH_CONFIG=${{ inputs.config_path }}"
+          set "NIGHT_BATCH_RUN_ID=gha_${{ github.run_id }}_${{ github.run_attempt }}"
+          set "NIGHT_BATCH_SKIP_SMOKE=1"
+          if defined NIGHT_BATCH_LIVE_CHECKOUT_BASELINE_PATH (
+            echo [diag] live_checkout_baseline=%NIGHT_BATCH_LIVE_CHECKOUT_BASELINE_PATH%
+          )
+          if "%NIGHT_BATCH_CONFIG%"=="" (
+            if "${{ github.event_name }}"=="workflow_dispatch" (
+              echo [diag] ERROR: workflow_dispatch requires a non-empty config_path
+              exit /b 1
+            )
+            set "NIGHT_BATCH_CONFIG=config/night_batch/bundle-foreground-reuse-config.json"
+          )
+          for /f "usebackq delims=" %%I in (`wsl.exe wslpath -a "%CD%"`) do set "REPO_WSL=%%I"
+          if not defined REPO_WSL exit /b 1
+          echo [diag] config_path=%NIGHT_BATCH_CONFIG%
+          echo [diag] night_batch_run_id=%NIGHT_BATCH_RUN_ID%
+          echo [diag] CD=%CD%
+          if not exist "%NIGHT_BATCH_CONFIG%" (
+            echo [diag] WARNING: config file not found at %NIGHT_BATCH_CONFIG%
+          )
+          wsl.exe bash -lc "cd \"%REPO_WSL%\" && python3 -c \"import json, sys; data = json.load(open(sys.argv[1], encoding='utf-8')); detach = data.get('runtime', {}).get('detach_after_smoke'); sys.exit(0 if detach is not True else 9)\" \"%NIGHT_BATCH_CONFIG%\""
+          set "CONFIG_CHECK_EXIT=%ERRORLEVEL%"
+          if "%CONFIG_CHECK_EXIT%"=="9" (
+            echo [diag] ERROR: workflow requires runtime.detach_after_smoke=false in %NIGHT_BATCH_CONFIG%
+            exit /b 1
+          )
+          if not "%CONFIG_CHECK_EXIT%"=="0" (
+            echo [diag] ERROR: failed to validate night batch config %NIGHT_BATCH_CONFIG%
+            exit /b %CONFIG_CHECK_EXIT%
+          )
+          scripts\windows\run-night-batch-self-hosted.cmd "%NIGHT_BATCH_CONFIG%"
+          set "BATCH_EXIT=%ERRORLEVEL%"
+          echo [diag] wrapper exit code=%BATCH_EXIT%
+          exit /b %BATCH_EXIT%
+
+      - name: Locate night batch outputs
+        if: always()
+        id: night_batch_outputs
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -command ". '{0}'"
+        run: |
+          & scripts/windows/github-actions/find-night-batch-outputs.ps1 -ExpectedRunId 'gha_${{ github.run_id }}_${{ github.run_attempt }}'
+
+      - name: Append night batch workflow summary
+        if: always()
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -command ". '{0}'"
+        run: |
+          & scripts/windows/github-actions/append-night-batch-workflow-summary.ps1 -SummaryJsonPath '${{ steps.night_batch_outputs.outputs.summary_json }}' -SummaryMdPath '${{ steps.night_batch_outputs.outputs.summary_md }}' -RichReportPath '${{ steps.night_batch_outputs.outputs.rich_report }}' -RankingArtifactPath '${{ steps.night_batch_outputs.outputs.ranking_artifact }}' -ProtectionReportPath '${{ steps.night_batch_outputs.outputs.protection_report }}' -CampaignManifestJsonPath '${{ steps.night_batch_outputs.outputs.campaign_manifest_json }}' -CampaignManifestMdPath '${{ steps.night_batch_outputs.outputs.campaign_manifest_md }}'
+
+      - name: Upload night batch artifacts
+        if: always() && steps.night_batch_outputs.outputs.round_dir != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: night-batch-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.night_batch_outputs.outputs.round_dir }}
+            ${{ steps.night_batch_outputs.outputs.campaign_artifact_paths }}
+          if-no-files-found: warn
+
+      - name: Archive completed night batch rounds
+        if: always()
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%I in (`wsl.exe wslpath -a "%CD%"`) do set "REPO_WSL=%%I"
+          if not defined REPO_WSL exit /b 1
+          wsl.exe bash -lc "cd \"%REPO_WSL%\" && python3 python/night_batch.py archive-rounds"
+
+      - name: Archive stale latest research docs
+        if: always()
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%I in (`wsl.exe wslpath -a "%CD%"`) do set "REPO_WSL=%%I"
+          if not defined REPO_WSL exit /b 1
+          wsl.exe bash -lc "cd \"%REPO_WSL%\" && node scripts/docs/archive-stale-latest.mjs"

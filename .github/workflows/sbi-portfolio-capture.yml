@@ -1,0 +1,133 @@
+name: SBI Portfolio Capture
+
+on:
+  workflow_dispatch:
+    inputs:
+      cdp_host:
+        description: Chrome CDP host
+        required: true
+        default: 127.0.0.1
+      cdp_port:
+        description: Chrome CDP port
+        required: true
+        default: '9222'
+      output_dir:
+        description: Repo-relative output directory
+        required: true
+        default: docs/reports/screener/portfolio/capture/latest
+      report_path:
+        description: Repo-relative output markdown path
+        required: true
+        default: docs/reports/screener/portfolio/sbi_portfolio_report.md
+      dry_run:
+        description: Probe only, do not click or navigate
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  capture-sbi-portfolio:
+    runs-on:
+      - self-hosted
+      - windows
+    env:
+      WSL_REPO_PATH: /home/fpxszk/code/Oh-MY-TradingView
+      SBI_CDP_HOST: ${{ inputs.cdp_host }}
+      SBI_CDP_PORT: ${{ inputs.cdp_port }}
+      SBI_CAPTURE_OUTPUT_DIR: ${{ inputs.output_dir }}
+      SBI_REPORT_PATH: ${{ inputs.report_path }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          clean: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci --silent
+
+      - name: Probe CDP endpoint
+        shell: pwsh
+        run: |
+          $versionUrl = "http://${{ env.SBI_CDP_HOST }}:${{ env.SBI_CDP_PORT }}/json/version"
+          $listUrl = "http://${{ env.SBI_CDP_HOST }}:${{ env.SBI_CDP_PORT }}/json/list"
+          Write-Host "Probing $versionUrl"
+          try {
+            $version = Invoke-RestMethod -Uri $versionUrl -TimeoutSec 5
+            Write-Host "CDP Browser: $($version.Browser)"
+            Write-Host "CDP Protocol-Version: $($version.'Protocol-Version')"
+          } catch {
+            Write-Host "CDP version probe failed: $($_.Exception.Message)"
+          }
+          Write-Host "Probing $listUrl"
+          try {
+            $targets = Invoke-RestMethod -Uri $listUrl -TimeoutSec 5
+            $count = @($targets).Count
+            Write-Host "CDP target count: $count"
+          } catch {
+            Write-Host "CDP target list probe failed: $($_.Exception.Message)"
+          }
+
+      - name: Capture SBI portfolio data
+        shell: pwsh
+        run: |
+          $args = @(
+            'scripts/sbi/capture-portfolio-data.mjs',
+            '--cdp-host', '${{ env.SBI_CDP_HOST }}',
+            '--cdp-port', '${{ env.SBI_CDP_PORT }}',
+            '--output-dir', '${{ env.SBI_CAPTURE_OUTPUT_DIR }}'
+          )
+          if ('${{ inputs.dry_run }}' -eq 'true') {
+            $args += '--dry-run'
+          }
+          node @args
+
+      - name: Validate capture output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path '${{ env.SBI_CAPTURE_OUTPUT_DIR }}/capture-summary.json')) {
+            throw 'capture-summary.json was not created'
+          }
+          if (-not (Test-Path '${{ env.SBI_CAPTURE_OUTPUT_DIR }}/capture-summary.md')) {
+            throw 'capture-summary.md was not created'
+          }
+
+      - name: Build SBI portfolio report
+        shell: pwsh
+        run: |
+          node scripts/sbi/build-portfolio-report.mjs `
+            --capture-dir '${{ env.SBI_CAPTURE_OUTPUT_DIR }}' `
+            --output '${{ env.SBI_REPORT_PATH }}'
+
+      - name: Validate report output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path '${{ env.SBI_REPORT_PATH }}')) {
+            throw '${{ env.SBI_REPORT_PATH }} was not created'
+          }
+
+      - name: Upload capture artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbi-portfolio-capture-${{ github.run_id }}
+          path: |
+            ${{ env.SBI_CAPTURE_OUTPUT_DIR }}
+            ${{ env.SBI_REPORT_PATH }}
+          if-no-files-found: warn
+
+      - name: Publish portfolio report to WSL main
+        if: success()
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows/github-actions/sync-portfolio-reports-to-wsl.ps1 `
+            -WslRepoPath "${{ env.WSL_REPO_PATH }}" `
+            -CommitMessage "docs: sbi portfolio report run ${{ github.run_id }}-${{ github.run_attempt }}" `
+            -RelativePaths "${{ env.SBI_CAPTURE_OUTPUT_DIR }}","${{ env.SBI_REPORT_PATH }}"

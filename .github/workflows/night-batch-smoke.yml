@@ -1,0 +1,114 @@
+name: Night Batch Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      config_path:
+        description: JSON config path relative to the repository root
+        required: true
+        default: config/night_batch/bundle-foreground-reuse-config.json
+
+jobs:
+  smoke-test:
+    timeout-minutes: 60
+    runs-on:
+      - self-hosted
+      - windows
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Install dependencies in WSL workspace
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%I in (`wsl.exe wslpath -a "%CD%"`) do set "REPO_WSL=%%I"
+          if not defined REPO_WSL exit /b 1
+          wsl.exe bash -lc "cd \"%REPO_WSL%\" && npm ci --silent"
+
+      - name: Ensure TradingView is running
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -command ". '{0}'"
+        run: |
+          $configPath = Join-Path $PWD '${{ inputs.config_path }}'
+          $config = Get-Content -Raw -Path $configPath | ConvertFrom-Json
+          $runtime = $config.runtime
+          $launch = $config.launch
+          if (-not $runtime -or -not $launch) {
+            throw "Config is missing runtime or launch sections: $configPath"
+          }
+
+          $startupUrl = "http://$($runtime.startup_check_host):$($runtime.startup_check_port)/json/list"
+          $alreadyRunning = $false
+          try {
+            $response = Invoke-WebRequest -UseBasicParsing -Uri $startupUrl -TimeoutSec 3
+            if ($response.Content -match 'tradingview' -and $response.Content -match '/chart') {
+              $alreadyRunning = $true
+              Write-Host "[diag] TradingView already reachable at $startupUrl"
+            }
+          } catch {
+            Write-Host "[diag] TradingView not reachable at $startupUrl; launching shortcut"
+          }
+
+          if (-not $alreadyRunning) {
+            if ($launch.shortcut_path -and (Test-Path $launch.shortcut_path)) {
+              Start-Process -FilePath $launch.shortcut_path -WindowStyle Normal
+            } else {
+              $shortcut = $null
+              $shortcutDir = Split-Path -Parent $launch.shortcut_path
+              if ($shortcutDir -and (Test-Path $shortcutDir)) {
+                $shortcut = Get-ChildItem -Path $shortcutDir -Filter '*.lnk' -File |
+                  Where-Object { $_.Name -match 'TradingView' } |
+                  Select-Object -First 1 -ExpandProperty FullName
+              }
+
+              if ($shortcut) {
+                Start-Process -FilePath $shortcut -WindowStyle Normal
+                Start-Sleep -Seconds $runtime.launch_wait_sec
+                return
+              }
+
+              $launcher = Join-Path $env:LOCALAPPDATA 'TradingView\TradingView.exe'
+              if (-not (Test-Path $launcher)) {
+                throw "No TradingView launcher found at $launcher, $($launch.shortcut_path), or any TradingView shortcut in $shortcutDir"
+              }
+              Start-Process -FilePath $launcher -ArgumentList "--remote-debugging-port=$($runtime.startup_check_port)" -WindowStyle Normal
+            }
+            Start-Sleep -Seconds $runtime.launch_wait_sec
+          }
+
+      - name: Readiness diagnostics (non-blocking)
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%I in (`wsl.exe wslpath -a "%CD%"`) do set "REPO_WSL=%%I"
+          if not defined REPO_WSL exit /b 0
+          set "NIGHT_BATCH_CONFIG=${{ inputs.config_path }}"
+          if "%NIGHT_BATCH_CONFIG%"=="" set "NIGHT_BATCH_CONFIG=config/night_batch/bundle-foreground-reuse-config.json"
+          echo [readiness-diag] Checking port connectivity and readiness
+          echo [readiness-diag] startup_check_port (local):
+          wsl.exe bash -lc "cd \"%REPO_WSL%\" && python3 -c \"import json,sys; c=json.load(open(sys.argv[1])); h=c.get('runtime',{}).get('startup_check_host','localhost'); p=c.get('runtime',{}).get('startup_check_port',9222); print(f'  host={h} port={p}'); import urllib.request; urllib.request.urlopen(f'http://{h}:{p}/json/list',timeout=3); print('  status=reachable')\" \"%NIGHT_BATCH_CONFIG%\"" 2>&1 || echo [readiness-diag] startup_check_port: UNREACHABLE
+          echo [readiness-diag] bridge port (WSL):
+          wsl.exe bash -lc "cd \"%REPO_WSL%\" && python3 -c \"import json,sys; c=json.load(open(sys.argv[1])); h=c.get('runtime',{}).get('host','172.31.144.1'); p=c.get('runtime',{}).get('port',9223); print(f'  host={h} port={p}'); import urllib.request; urllib.request.urlopen(f'http://{h}:{p}/json/list',timeout=3); print('  status=reachable')\" \"%NIGHT_BATCH_CONFIG%\"" 2>&1 || echo [readiness-diag] bridge port: UNREACHABLE
+          echo [readiness-diag] tv status readiness:
+          wsl.exe bash -lc "cd \"%REPO_WSL%\" && python3 -c \"import json, os, subprocess, sys; c=json.load(open(sys.argv[1])); runtime=c.get('runtime',{}); host=str(runtime.get('host','172.31.144.1')); port=str(runtime.get('port',9223)); print(f'  host={host} port={port}'); env=dict(os.environ, TV_CDP_HOST=host, TV_CDP_PORT=port); proc=subprocess.run(['node','src/cli/index.js','status'], env=env, text=True, capture_output=True); sys.stdout.write(proc.stdout); sys.stderr.write(proc.stderr); raise SystemExit(proc.returncode)\" \"%NIGHT_BATCH_CONFIG%\"" 2>&1 || echo [readiness-diag] tv status: FAILED
+          echo [readiness-diag] done
+        continue-on-error: true
+
+      - name: Wait for TradingView connection (required gate)
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%I in (`wsl.exe wslpath -a "%CD%"`) do set "REPO_WSL=%%I"
+          if not defined REPO_WSL exit /b 1
+          set "NIGHT_BATCH_CONFIG=${{ inputs.config_path }}"
+          if "%NIGHT_BATCH_CONFIG%"=="" set "NIGHT_BATCH_CONFIG=config/night_batch/bundle-foreground-reuse-config.json"
+          echo [connection-gate] Waiting for TradingView connection before smoke
+          wsl.exe bash -lc "cd \"%REPO_WSL%\" && node scripts/backtest/wait-for-tradingview-readiness.mjs --config \"%NIGHT_BATCH_CONFIG%\" --timeout-sec 180 --interval-sec 5"
+
+      - name: Run smoke test only
+        shell: cmd
+        run: |
+          set "NIGHT_BATCH_CONFIG=${{ inputs.config_path }}"
+          if "%NIGHT_BATCH_CONFIG%"=="" set "NIGHT_BATCH_CONFIG=config/night_batch/bundle-foreground-reuse-config.json"
+          for /f "usebackq delims=" %%I in (`wsl.exe wslpath -a "%CD%"`) do set "REPO_WSL=%%I"
+          if not defined REPO_WSL exit /b 1
+          echo [diag] config_path=%NIGHT_BATCH_CONFIG%
+          wsl.exe bash -lc "cd \"%REPO_WSL%\" && python3 python/night_batch.py smoke-prod --config \"%NIGHT_BATCH_CONFIG%\" --smoke-only"

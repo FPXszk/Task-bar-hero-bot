@@ -1,0 +1,86 @@
+name: Daily Fundamental Screener
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-screener:
+    runs-on:
+      - self-hosted
+      - windows
+    env:
+      WSL_REPO_PATH: /home/fpxszk/code/Oh-MY-TradingView
+      SCREENER_WORKFLOW_LABEL: daily-screener
+      SCREENER_REPORT_PATH: docs/reports/screener/daily-ranking.md
+      SCREENER_METADATA_PATH: docs/reports/screener/daily-ranking-run.json
+      SCREENER_RESULT_LIMIT: '90'
+      SCREENER_MARKET: america
+      SCREENER_EXCHANGES: NASDAQ,NYSE
+      SCREENER_SELECTED_SECTOR_COUNT: '3'
+      SCREENER_GROSS_MARGIN_MIN_PCT: '30'
+      SCREENER_SCOPE_LABEL: NASDAQ + NYSE stocks only (OTC excluded)
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          clean: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci --silent
+
+      - name: Run fundamental screener
+        run: node scripts/screener/run-fundamental-screening.mjs
+
+      - name: Validate screener report output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path '${{ env.SCREENER_REPORT_PATH }}')) {
+            throw '${{ env.SCREENER_REPORT_PATH }} was not created by the screener step'
+          }
+
+      - name: Write screener run metadata
+        shell: pwsh
+        run: |
+          $metadataPath = '${{ env.SCREENER_METADATA_PATH }}'
+          $metadataDir = Split-Path -Parent $metadataPath
+          if (-not (Test-Path $metadataDir)) {
+            New-Item -ItemType Directory -Path $metadataDir -Force | Out-Null
+          }
+
+          $metadata = [ordered]@{
+            workflow = '${{ env.SCREENER_WORKFLOW_LABEL }}'
+            report_path = '${{ env.SCREENER_REPORT_PATH }}'
+            run_id = '${{ github.run_id }}'
+            run_attempt = '${{ github.run_attempt }}'
+            run_number = '${{ github.run_number }}'
+            ref_name = '${{ github.ref_name }}'
+            sha = '${{ github.sha }}'
+            generated_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+          }
+
+          $metadata | ConvertTo-Json -Depth 4 | Out-File -FilePath $metadataPath -Encoding utf8
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screener-report-${{ github.run_id }}
+          path: |
+            ${{ env.SCREENER_REPORT_PATH }}
+            ${{ env.SCREENER_METADATA_PATH }}
+          if-no-files-found: warn
+
+      - name: Publish screener report to WSL main
+        if: success()
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows/github-actions/sync-daily-screener-report-to-wsl.ps1 `
+            -WslRepoPath "${{ env.WSL_REPO_PATH }}" `
+            -ReportPath "${{ env.SCREENER_REPORT_PATH }}" `
+            -MetadataPath "${{ env.SCREENER_METADATA_PATH }}" `
+            -CommitMessage "docs: daily screener report run ${{ github.run_id }}-${{ github.run_attempt }}"
